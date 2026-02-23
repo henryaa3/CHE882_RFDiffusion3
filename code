@@ -1,0 +1,177 @@
+#######################################################################
+# RFdiffusion3 (rfd3) end-to-end: install + checkpoints + runs for RIXI
+# Location: /mnt/gs21/scratch/henryaa3/rfdiffusion3
+#######################################################################
+
+set -euo pipefail
+
+########################################
+# 0) Go to project folder
+########################################
+cd /mnt/gs21/scratch/henryaa3/rfdiffusion3
+
+########################################
+# 1) Install Miniforge locally (no modules needed)
+#    NOTE: if already installed, you can skip this block.
+########################################
+MINIFORGE="/mnt/gs21/scratch/henryaa3/rfdiffusion3/miniforge3"
+
+if [ ! -d "$MINIFORGE" ]; then
+  curl -L -o Miniforge3.sh \
+    https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+  bash Miniforge3.sh -b -p "$MINIFORGE"
+fi
+
+# Enable conda in this shell
+source "$MINIFORGE/etc/profile.d/conda.sh"
+conda config --set auto_activate_base false || true
+
+########################################
+# 2) Create Python 3.12 env and install Foundry (provides rfd3)
+#    NOTE: if env already exists, you can skip conda create.
+########################################
+ENV="/mnt/gs21/scratch/henryaa3/rfdiffusion3/foundry_py312"
+
+if [ ! -d "$ENV" ]; then
+  conda create -y -p "$ENV" python=3.12 pip
+fi
+conda activate "$ENV"
+
+# Avoid PYTHONPATH contaminating conda python
+unset PYTHONPATH || true
+
+python --version
+python -m pip install -U pip setuptools wheel
+
+# Install Foundry + rfd3 CLI
+python -m pip install "rc-foundry[all]"
+
+# Verify rfd3 exists
+which rfd3
+rfd3 --help | head -n 20
+
+########################################
+# 3) Checkpoints: download base models (rfd3, rf3, mpnn) into local folder
+########################################
+CKPTS="/mnt/gs21/scratch/henryaa3/rfdiffusion3/foundry_ckpts"
+mkdir -p "$CKPTS"
+
+# Download
+foundry install base-models --checkpoint-dir "$CKPTS"
+
+# Tell Foundry where checkpoints live (do this every time before running)
+export FOUNDRY_CHECKPOINT_DIRS="$CKPTS"
+
+########################################
+# 4) Convenience activation script (use this before runs)
+########################################
+cat > /mnt/gs21/scratch/henryaa3/rfdiffusion3/activate_rfd3.sh <<'SH'
+#!/bin/bash
+source /mnt/gs21/scratch/henryaa3/rfdiffusion3/miniforge3/etc/profile.d/conda.sh
+unset PYTHONPATH
+conda activate /mnt/gs21/scratch/henryaa3/rfdiffusion3/foundry_py312
+export FOUNDRY_CHECKPOINT_DIRS=/mnt/gs21/scratch/henryaa3/rfdiffusion3/foundry_ckpts
+SH
+chmod +x /mnt/gs21/scratch/henryaa3/rfdiffusion3/activate_rfd3.sh
+
+########################################
+# 5) ORIGINAL RUN (de novo by length): 1 design, based on RIXI fasta length
+#    IMPORTANT: use +specification.length due to Hydra strict configs.
+########################################
+source /mnt/gs21/scratch/henryaa3/rfdiffusion3/activate_rfd3.sh
+
+L=$(grep -v '^>' rixi.fasta | tr -d '\n' | wc -c)
+OUT_ORIG="/mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_len_gpu"
+mkdir -p "$OUT_ORIG"
+
+# On GPU this should be submitted via sbatch; if you run on a dev node you'll hit libcuda issues.
+# This command is what produced outputs like __0_model_0.cif.gz and __0_model_0.json:
+rfd3 design \
+  out_dir="$OUT_ORIG" \
+  inputs=null \
+  +specification.length=$L \
+  n_batches=1 \
+  diffusion_batch_size=1
+
+########################################
+# 6) LOOP REMODEL INPUT (RIXI-only): remodel residues A152-A170 (1 design)
+#    - Keep backbone outside window fixed (BKBN)
+#    - Allow only 152-170 sequence to change
+########################################
+cat > /mnt/gs21/scratch/henryaa3/rfdiffusion3/rixi_loop_remodel_A152_A170_v1.yaml <<'YAML'
+rixi_loop_remodel_v1:
+  dialect: 2
+  input: /mnt/gs21/scratch/henryaa3/rfdiffusion3/fold_1_rixi_model_0.pdb
+
+  contig: A1-275
+
+  select_fixed_atoms:
+    A1-151: BKBN
+    A171-275: BKBN
+
+  select_unfixed_sequence: A152-170
+
+  partial_t: 6.0
+YAML
+
+########################################
+# 7) GPU JOB (sbatch): loop remodel, exactly 1 design, unique output folder
+########################################
+cat > /mnt/gs21/scratch/henryaa3/rfdiffusion3/submit_rfd3_rixi_loop_A152_A170_1design.sbatch <<'SBATCH'
+#!/bin/bash
+#SBATCH --job-name=rfd3RIXIloop
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
+#SBATCH --output=/mnt/gs21/scratch/henryaa3/rfdiffusion3/log_rfd3_rixi_loop_A152_A170_%j.out
+#SBATCH --error=/mnt/gs21/scratch/henryaa3/rfdiffusion3/log_rfd3_rixi_loop_A152_A170_%j.err
+
+set -euo pipefail
+
+cd /mnt/gs21/scratch/henryaa3/rfdiffusion3
+source ./activate_rfd3.sh
+
+OUT=/mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_loop_A152_A170_1design_run1
+mkdir -p "$OUT"
+
+nvidia-smi
+
+# Exactly 1 design: n_batches * diffusion_batch_size = 1
+rfd3 design \
+  out_dir="$OUT" \
+  inputs=/mnt/gs21/scratch/henryaa3/rfdiffusion3/rixi_loop_remodel_A152_A170_v1.yaml \
+  n_batches=1 \
+  diffusion_batch_size=1
+SBATCH
+
+# Submit the job
+sbatch /mnt/gs21/scratch/henryaa3/rfdiffusion3/submit_rfd3_rixi_loop_A152_A170_1design.sbatch
+
+########################################
+# 8) Output inspection (after job finishes)
+########################################
+# Original run outputs (example):
+#   /mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_len_gpu/__0_model_0.cif.gz
+#   /mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_len_gpu/__0_model_0.json
+#
+# Loop remodel outputs (example):
+#   /mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_loop_A152_A170_1design_run1/__0_model_0.cif.gz
+#   /mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_loop_A152_A170_1design_run1/__0_model_0.json
+#
+# Commands:
+# ls -lh $OUT_ORIG
+# ls -lh /mnt/gs21/scratch/henryaa3/rfdiffusion3/out_rfd3_rixi_loop_A152_A170_1design_run1
+#
+# To decompress a cif.gz:
+# gunzip -k __0_model_0.cif.gz
+#######################################################################
+
+  align rixi_loop_remodel_A152_A170_v1_rixi_loop_remodel_v1_0_model_0, _0_model_0_1
+hide everything
+show cartoon, _0_model_0_1
+show cartoon, rixi_loop_remodel_A152_A170_v1_rixi_loop_remodel_v1_0_model_0
+color gray70, _0_model_0_1
+color cyan, rixi_loop_remodel_A152_A170_v1_rixi_loop_remodel_v1_0_model_0
+orient
